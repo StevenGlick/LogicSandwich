@@ -158,8 +158,9 @@ class PulseEngine:
         for e in entries:
             if "," not in e["subject"]:
                 all_subjects.add(e["subject"])
-            if "," not in e["object"] and e["predicate"] not in skip:
-                po_groups[(e["predicate"], e["object"])].append(e["subject"])
+                # Only single subjects go into groups — prevents recursive compounding
+                if "," not in e["object"] and e["predicate"] not in skip:
+                    po_groups[(e["predicate"], e["object"])].append(e["subject"])
 
         # Specificity threshold: skip properties shared by >50% of all subjects
         total_subjects = max(len(all_subjects), 1)

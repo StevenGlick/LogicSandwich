@@ -392,8 +392,9 @@ class PulseEngine:
         for e in entries:
             if "," not in e["subject"]:
                 all_subjects.add(e["subject"])
-            if "," not in e["object"] and e["predicate"] not in skip:
-                po[(e["predicate"],e["object"])].append(e["subject"])
+                # Only single subjects go into groups — prevents recursive compounding
+                if "," not in e["object"] and e["predicate"] not in skip:
+                    po[(e["predicate"],e["object"])].append(e["subject"])
         total_subjects = max(len(all_subjects), 1)
         count = 0
         for (p,o), subs in po.items():
