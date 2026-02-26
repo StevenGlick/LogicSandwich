@@ -79,77 +79,85 @@ class PulseEngine:
         return total_new
     
     def _merge(self, gen, existing):
-        """Combine same-subject same-predicate entries."""
+        """Combine same-subject same-predicate entries (within same context)."""
         entries = self.db.all_entries("T")
         groups = defaultdict(list)
         for e in entries:
             if "," not in e["object"]:
-                groups[(e["subject"], e["predicate"])].append(e["object"])
-        
+                groups[(e["subject"], e["context"], e["predicate"])].append(e["object"])
+
         count = 0
-        for (subj, pred), objects in groups.items():
+        for (subj, ctx, pred), objects in groups.items():
             unique = sorted(set(objects))
             if len(unique) < 2:
                 continue
             merged = ",".join(unique)
-            if (subj, pred, merged) in existing:
+            if (subj, ctx, pred, merged) in existing:
                 continue
-            
-            self.db.add(subj, pred, merged, "T",
+
+            self.db.add(subj, pred, merged, "T", context=ctx,
                 evidence_for=[f"merged {len(unique)} entries"],
                 source="idea:merge", generation=gen)
-            existing.add((subj, pred, merged))
+            existing.add((subj, ctx, pred, merged))
             count += 1
             if count >= CAP:
                 break
         return count
     
     def _transitive(self, gen, existing):
-        """If A→B and B→C, propose A→C."""
+        """If A→B and B→C, propose A→C (context-aware: only chains within same context)."""
         entries = self.db.all_entries("T")
         skip = {"structurally_similar_to", "commonly_confused_with",
                 "analogous_to", "inspired_by", "defined_by"}
-        
-        # Build lookup: subject → [(predicate, object)]
-        by_subject = defaultdict(list)
+
+        # Index by (subject, context) for context-aware chaining
+        by_subj_ctx = defaultdict(list)
+        subj_contexts = defaultdict(set)
         for e in entries:
             if "," not in e["object"] and e["predicate"] not in skip:
-                by_subject[e["subject"]].append(e)
-        
+                by_subj_ctx[(e["subject"], e["context"])].append(e)
+                subj_contexts[e["subject"]].add(e["context"])
+
         count = 0
         for e in entries:
             if "," in e["object"] or e["predicate"] in skip:
                 continue
             obj = e["object"]
-            if obj not in by_subject:
+            source_ctx = e["context"]
+            if obj not in subj_contexts:
                 continue
-            for e2 in by_subject[obj]:
-                if e2["predicate"] in skip or "," in e2["object"]:
+            for target_ctx in subj_contexts[obj]:
+                # Context gate: only chain within same context or through "general"
+                if target_ctx != source_ctx and target_ctx != "general" and source_ctx != "general":
                     continue
-                sig = (e["subject"], e2["predicate"], e2["object"])
-                if sig in existing or e["subject"] == e2["object"]:
-                    continue
-                # Predicate transparency: block invalid property inheritance
-                allowed, reason = self.transitive_filter.check_chain(
-                    e["predicate"], e2["predicate"])
-                if not allowed:
-                    continue
+                for e2 in by_subj_ctx[(obj, target_ctx)]:
+                    if e2["predicate"] in skip or "," in e2["object"]:
+                        continue
+                    sig = (e["subject"], source_ctx, e2["predicate"], e2["object"])
+                    if sig in existing or e["subject"] == e2["object"]:
+                        continue
+                    # Predicate transparency: block invalid property inheritance
+                    allowed, reason = self.transitive_filter.check_chain(
+                        e["predicate"], e2["predicate"])
+                    if not allowed:
+                        continue
 
-                self.db.add(
-                    e["subject"], e2["predicate"], e2["object"], "M",
-                    evidence_for=[f"transitive[{e['predicate']}→{e2['predicate']}]: {e['subject']}→{obj}→{e2['object']}"],
-                    source="idea:transitive", generation=gen,
-                    needs_verification=True)
-                existing.add(sig)
-                count += 1
-                if count >= CAP:
-                    return count
+                    self.db.add(
+                        e["subject"], e2["predicate"], e2["object"], "M",
+                        context=source_ctx,
+                        evidence_for=[f"transitive[{e['predicate']}→{e2['predicate']}]: {e['subject']}({source_ctx})→{obj}→{e2['object']}"],
+                        source="idea:transitive", generation=gen,
+                        needs_verification=True)
+                    existing.add(sig)
+                    count += 1
+                    if count >= CAP:
+                        return count
         return count
     
     def _cross_domain(self, gen, existing):
         """Find where different subjects share exact same predicate+object.
-        If a bridge system is available, check for existing bridges and
-        create candidate bridges for new cross-domain discoveries."""
+        Context-aware: same-context pairs keep their context, cross-context pairs
+        get 'cross_domain' context."""
         entries = self.db.all_entries("T")
         skip = {"is_a", "structurally_similar_to", "commonly_confused_with"}
 
@@ -157,10 +165,10 @@ class PulseEngine:
         all_subjects = set()
         for e in entries:
             if "," not in e["subject"]:
-                all_subjects.add(e["subject"])
+                all_subjects.add((e["subject"], e["context"]))
                 # Only single subjects go into groups — prevents recursive compounding
                 if "," not in e["object"] and e["predicate"] not in skip:
-                    po_groups[(e["predicate"], e["object"])].append(e["subject"])
+                    po_groups[(e["predicate"], e["object"])].append((e["subject"], e["context"]))
 
         # Specificity threshold: skip properties shared by >50% of all subjects
         total_subjects = max(len(all_subjects), 1)
@@ -171,20 +179,22 @@ class PulseEngine:
                 continue
             if len(unique_subjects) / total_subjects > 0.5:
                 continue  # too generic to be meaningful
-            for s1, s2 in combinations(unique_subjects, 2):
+            for (s1, ctx1), (s2, ctx2) in combinations(unique_subjects, 2):
+                # Determine compound context
+                compound_ctx = ctx1 if ctx1 == ctx2 else "cross_domain"
                 combined = f"{s1},{s2}"
-                sig = (combined, f"both_{pred}", obj)
+                sig = (combined, compound_ctx, f"both_{pred}", obj)
                 if sig in existing:
                     continue
 
                 # Bridge awareness: check if this pair has an existing bridge
-                evidence = ["cross-domain pattern"]
+                evidence = [f"cross-domain: {s1}({ctx1}) and {s2}({ctx2}) share {pred}({obj})"]
                 if self.bridges:
                     b1 = self.bridges.find_bridges(s1)
                     has_bridge = any(
                         b["term_a"] == s2 or b["term_b"] == s2 for b in b1)
                     if has_bridge:
-                        evidence = [f"cross-domain pattern (bridge-validated: {s1}↔{s2})"]
+                        evidence = [f"cross-domain (bridge-validated: {s1}↔{s2})"]
                     else:
                         # No bridge exists — register as candidate
                         self.bridges.add_bridge(
@@ -194,6 +204,7 @@ class PulseEngine:
                             discovered_by="pulse")
 
                 self.db.add(combined, f"both_{pred}", obj, "T",
+                    context=compound_ctx,
                     evidence_for=evidence,
                     source="idea:cross_domain", generation=gen)
                 existing.add(sig)
@@ -203,28 +214,32 @@ class PulseEngine:
         return count
     
     def _analogy(self, gen, existing):
-        """Find structurally similar subjects (share predicate types)."""
+        """Find structurally similar subjects (share predicate types).
+        Only compares within same context to avoid false analogies."""
         entries = self.db.all_entries("T")
         skip = {"structurally_similar_to", "commonly_confused_with", "analogous_to"}
-        
+
         profiles = defaultdict(set)
         for e in entries:
-            if not e["subject"].startswith("category(") and e["predicate"] not in skip:
-                profiles[e["subject"]].add(e["predicate"])
-        
+            if not e["subject"].startswith("category(") and e["predicate"] not in skip and "," not in e["subject"]:
+                profiles[(e["subject"], e["context"])].add(e["predicate"])
+
         count = 0
         subjects = sorted(profiles.keys())
-        for s1, s2 in combinations(subjects, 2):
-            shared = profiles[s1] & profiles[s2] - skip
-            total = (profiles[s1] | profiles[s2]) - skip
+        for (s1, ctx1), (s2, ctx2) in combinations(subjects, 2):
+            if ctx1 != ctx2:
+                continue  # only compare within same context
+            shared = profiles[(s1, ctx1)] & profiles[(s2, ctx2)] - skip
+            total = (profiles[(s1, ctx1)] | profiles[(s2, ctx2)]) - skip
             if not total:
                 continue
             sim = len(shared) / len(total)
             if sim >= 0.6:
-                sig = (s1, "structurally_similar_to", s2)
+                sig = (s1, ctx1, "structurally_similar_to", s2)
                 if sig in existing:
                     continue
                 self.db.add(s1, "structurally_similar_to", s2, "T",
+                    context=ctx1,
                     evidence_for=[f"similarity={sim:.0%}, shared={sorted(shared)}"],
                     source="idea:analogy", generation=gen)
                 existing.add(sig)
@@ -268,11 +283,14 @@ class Verifier:
             evidence = json.loads(entry["evidence_for"])
 
             if self.llm.available:
-                # REAL LLM VERIFICATION
+                # REAL LLM VERIFICATION (context-aware)
                 t0 = time.time()
+                ctx = entry.get("context", "general")
+                definition = self.db.get_concept(entry["subject"], ctx)
                 verdict, reasoning, new_facts = self.llm.verify_entry(
                     entry["subject"], entry["predicate"],
-                    entry["object"], evidence)
+                    entry["object"], evidence,
+                    context=ctx, definition=definition)
                 elapsed = time.time() - t0
 
                 self.db.update_truth(entry["id"], verdict, f"LLM: {reasoning[:100]}")
@@ -282,12 +300,13 @@ class Verifier:
                 if entry.get("source") == "idea:transitive":
                     self._record_predicate_outcome(evidence, verdict)
 
-                # Any new facts the LLM discovered get added
+                # Any new facts the LLM discovered get added (inherit context)
                 gen = self.db.current_generation()
                 for nf in new_facts:
                     added = self.db.add(
                         nf["subject"], nf["predicate"], nf["object"],
                         nf.get("truth_value", "M"),
+                        context=nf.get("context", ctx),
                         source="llm:decomposition", generation=gen)
                     if added:
                         new_entries += 1
@@ -327,22 +346,42 @@ class Verifier:
 # ═══════════════════════════════════════════════════════════
 
 def seed_from_json(db, json_path):
-    """Load seed entries from a JSON knowledge base file."""
+    """Load seed entries from a JSON knowledge base file.
+    Supports both old (bare array) and new (object with concepts) formats."""
     with open(json_path) as f:
         data = json.load(f)
-    
+
+    # Handle both formats: bare array or object with entries key
+    if isinstance(data, list):
+        entries = data
+        default_context = "general"
+        concepts = []
+    else:
+        entries = data.get("entries", [])
+        default_context = data.get("default_context", "general")
+        concepts = data.get("concepts", [])
+
+    # Load concept definitions first
+    if concepts:
+        db.enable_concepts()
+        for c in concepts:
+            db.add_concept(c["subject"], c["context"], c["definition"], source="seed")
+        print(f"  Loaded {len(concepts)} concept definitions")
+
     count = 0
-    for entry in data["entries"]:
+    for entry in entries:
+        context = entry.get("context", default_context)
         added = db.add(
             entry["subject"], entry["predicate"], entry["object"],
             entry.get("truth_value", "T"),
+            context=context,
             evidence_for=entry.get("evidence_for", []),
             evidence_against=entry.get("evidence_against", []),
             source=entry.get("source", "seed"),
             generation=0)
         if added:
             count += 1
-    
+
     print(f"  Seeded {count} entries from {json_path}")
     return count
 
@@ -372,6 +411,11 @@ def seed_from_topic(db, llm, topic):
     if not response:
         return 0
     
+    # Auto-classify context from topic
+    from domain_scope import DomainClassifier
+    classifier = DomainClassifier()
+    topic_context = classifier.classify_context(topic.lower().replace(" ", "_"))
+
     count = 0
     for line in response.strip().split("\n"):
         line = line.strip().strip("-•* ")
@@ -381,12 +425,13 @@ def seed_from_topic(db, llm, topic):
         if len(parts) >= 3:
             tv = parts[3] if len(parts) > 3 and parts[3] in ("T","F","M") else "T"
             added = db.add(parts[0], parts[1], parts[2], tv,
+                context=topic_context,
                 evidence_for=["LLM seed generation"],
                 source="llm:seed", generation=0)
             if added:
                 count += 1
-    
-    print(f"  Seeded {count} entries about '{topic}' from LLM")
+
+    print(f"  Seeded {count} entries about '{topic}' ({topic_context}) from LLM")
     return count
 
 

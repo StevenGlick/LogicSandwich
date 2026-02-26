@@ -53,8 +53,9 @@ class LLMBase:
 
     # ── Verification ──────────────────────────────────────
 
-    def verify_entry(self, subject, predicate, obj, evidence):
-        """Ask LLM to verify a single claim. Returns (verdict, reason, new_facts)."""
+    def verify_entry(self, subject, predicate, obj, evidence, context=None, definition=None):
+        """Ask LLM to verify a single claim. Returns (verdict, reason, new_facts).
+        If context/definition provided, grounds the LLM on what the subject IS."""
         system = """You evaluate knowledge claims. Respond with EXACTLY this format, no markdown:
 
 VERDICT: T
@@ -69,6 +70,7 @@ Rules:
 - VERDICT must be T (true), F (false), or M (genuinely uncertain)
 - Default to T for well-known facts. Default to F for clear nonsense.
 - Only use M if the claim is genuinely debatable.
+- If a context/domain is provided, evaluate the claim WITHIN that domain.
 - Optionally add NEW_FACTS on separate lines: subject|predicate|object|T"""
 
         # Format evidence cleanly
@@ -77,7 +79,14 @@ Rules:
         else:
             ev_str = str(evidence)
 
-        prompt = f"Is this true? {subject} {predicate} {obj}\nEvidence: {ev_str}"
+        # Build context-aware prompt
+        context_line = ""
+        if context and definition:
+            context_line = f"Context: '{subject}' refers to: {definition} (domain: {context})\n"
+        elif context:
+            context_line = f"Domain: {context}\n"
+
+        prompt = f"{context_line}Is this true? {subject} {predicate} {obj}\nEvidence: {ev_str}"
         response = self.ask(prompt, system)
         if not response:
             return "M", "unavailable", []
@@ -106,24 +115,29 @@ Rules:
                     tv = parts[3].upper()[:1] if len(parts) > 3 and parts[3].strip().upper()[:1] in "TFM" else "T"
                     new_facts.append({
                         "subject": parts[0], "predicate": parts[1],
-                        "object": parts[2], "truth_value": tv
+                        "object": parts[2], "truth_value": tv,
+                        "context": context or "general"
                     })
 
         return verdict, reason, new_facts
 
     # ── Curriculum ────────────────────────────────────────
 
-    def generate_facts(self, topic, grade_level, existing_subjects=None, curriculum=None):
+    def generate_facts(self, topic, grade_level, existing_subjects=None, curriculum=None, context=None):
         """Generate atomic facts about a topic at a grade level."""
         if curriculum:
             grade_desc = curriculum.get(grade_level, {}).get("name", f"Grade {grade_level}")
         else:
             grade_desc = f"Grade {grade_level}"
 
-        context = ""
+        known_context = ""
         if existing_subjects:
             sample = sorted(existing_subjects)[:30]
-            context = f"\nThe student already knows about: {', '.join(sample)}"
+            known_context = f"\nThe student already knows about: {', '.join(sample)}"
+
+        domain_constraint = ""
+        if context:
+            domain_constraint = f"\n- All facts should be within the '{context}' domain"
 
         system = f"""You are building a knowledge base for a student at the {grade_desc} level.
 Generate 15-25 atomic facts about the topic. Each fact is ONE relationship.
@@ -138,8 +152,8 @@ Rules:
 - Predicates: is_a, has_part, made_of, needs, produces, bigger_than,
   contains, causes, used_for, lives_in, eats, can, cannot, etc.
 - Each fact must be atomic: ONE subject, ONE predicate, ONE object
-- No explanations, just the facts
-{context}"""
+- No explanations, just the facts{domain_constraint}
+{known_context}"""
 
         prompt = f"Generate atomic knowledge facts about: {topic}"
         response = self.ask(prompt, system, temperature=0.5)
@@ -154,7 +168,8 @@ Rules:
             parts = [p.strip().lower().replace(" ", "_") for p in line.split("|")]
             if len(parts) >= 3 and parts[0] and parts[1] and parts[2]:
                 facts.append({
-                    "subject": parts[0], "predicate": parts[1], "object": parts[2]
+                    "subject": parts[0], "predicate": parts[1], "object": parts[2],
+                    "context": context or "general"
                 })
         return facts
 

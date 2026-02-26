@@ -36,9 +36,9 @@ def fnv1a_64(data):
         h -= (1 << 64)
     return h
 
-def triple_hash(subject, predicate, obj):
-    """Hash a full triple for fast duplicate detection."""
-    return fnv1a_64(f"{subject}|{predicate}|{obj}")
+def triple_hash(subject, context, predicate, obj):
+    """Hash a full quad (subject+context+predicate+object) for fast duplicate detection."""
+    return fnv1a_64(f"{subject}|{context}|{predicate}|{obj}")
 
 
 class KnowledgeDB:
@@ -63,6 +63,7 @@ class KnowledgeDB:
             CREATE TABLE IF NOT EXISTS entries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 subject TEXT NOT NULL,
+                context TEXT NOT NULL DEFAULT 'general',
                 predicate TEXT NOT NULL,
                 object TEXT NOT NULL,
                 quantifier TEXT DEFAULT 'universal',
@@ -78,11 +79,13 @@ class KnowledgeDB:
             );
 
             CREATE INDEX IF NOT EXISTS idx_subject ON entries(subject);
+            CREATE INDEX IF NOT EXISTS idx_subject_context ON entries(subject, context);
             CREATE INDEX IF NOT EXISTS idx_predicate ON entries(predicate);
             CREATE INDEX IF NOT EXISTS idx_object ON entries(object);
             CREATE INDEX IF NOT EXISTS idx_truth ON entries(truth_value);
             CREATE INDEX IF NOT EXISTS idx_source ON entries(source);
-            CREATE INDEX IF NOT EXISTS idx_sig ON entries(subject, predicate, object);
+            CREATE INDEX IF NOT EXISTS idx_sig ON entries(subject, context, predicate, object);
+            CREATE INDEX IF NOT EXISTS idx_context ON entries(context);
             CREATE INDEX IF NOT EXISTS idx_grade ON entries(grade_level);
         """)
         self.conn.commit()
@@ -93,7 +96,7 @@ class KnowledgeDB:
         """Add FNV-1a hash columns for fast lookups. Safe to call repeatedly."""
         cols = {r[1] for r in self.cursor.execute("PRAGMA table_info(entries)").fetchall()}
         added = False
-        for col in ("subject_hash", "predicate_hash", "object_hash", "triple_hash"):
+        for col in ("subject_hash", "context_hash", "predicate_hash", "object_hash", "triple_hash"):
             if col not in cols:
                 self.cursor.execute(f"ALTER TABLE entries ADD COLUMN {col} INTEGER DEFAULT 0")
                 added = True
@@ -113,15 +116,15 @@ class KnowledgeDB:
     def _backfill_hashes(self):
         """Compute hashes for existing rows that have hash=0."""
         self.cursor.execute(
-            "SELECT id, subject, predicate, object FROM entries WHERE triple_hash=0 OR triple_hash IS NULL")
+            "SELECT id, subject, context, predicate, object FROM entries WHERE triple_hash=0 OR triple_hash IS NULL")
         rows = self.cursor.fetchall()
         if not rows:
             return
         for r in rows:
-            s, p, o = r[1], r[2], r[3]
+            s, ctx, p, o = r[1], r[2], r[3], r[4]
             self.cursor.execute(
-                "UPDATE entries SET subject_hash=?, predicate_hash=?, object_hash=?, triple_hash=? WHERE id=?",
-                (fnv1a_64(s), fnv1a_64(p), fnv1a_64(o), triple_hash(s, p, o), r[0]))
+                "UPDATE entries SET subject_hash=?, context_hash=?, predicate_hash=?, object_hash=?, triple_hash=? WHERE id=?",
+                (fnv1a_64(s), fnv1a_64(ctx), fnv1a_64(p), fnv1a_64(o), triple_hash(s, ctx, p, o), r[0]))
         self.conn.commit()
 
     # ── Table Enablement ──────────────────────────────────
@@ -197,39 +200,97 @@ class KnowledgeDB:
         self.conn.commit()
         self._enabled_tables.add("ingest_log")
 
+    # ── Concepts Table ────────────────────────────────────
+
+    def enable_concepts(self):
+        self.cursor.executescript("""
+            CREATE TABLE IF NOT EXISTS concepts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                subject TEXT NOT NULL,
+                context TEXT NOT NULL,
+                definition TEXT NOT NULL,
+                source TEXT DEFAULT 'seed',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(subject, context)
+            );
+            CREATE INDEX IF NOT EXISTS idx_concept_subject ON concepts(subject);
+            CREATE INDEX IF NOT EXISTS idx_concept_ctx ON concepts(context);
+        """)
+        self.conn.commit()
+        self._enabled_tables.add("concepts")
+
+    def add_concept(self, subject, context, definition, source="seed"):
+        """Add or update a concept definition. Returns True if added/updated."""
+        if not self._has_table("concepts"):
+            self.enable_concepts()
+        self.cursor.execute(
+            "SELECT id FROM concepts WHERE subject=? AND context=?",
+            (subject, context))
+        if self.cursor.fetchone():
+            self.cursor.execute(
+                "UPDATE concepts SET definition=?, source=? WHERE subject=? AND context=?",
+                (definition, source, subject, context))
+        else:
+            self.cursor.execute(
+                "INSERT INTO concepts (subject, context, definition, source) VALUES (?,?,?,?)",
+                (subject, context, definition, source))
+        self.conn.commit()
+        return True
+
+    def get_concept(self, subject, context):
+        """Get concept definition. Returns definition string or None."""
+        if not self._has_table("concepts"):
+            return None
+        self.cursor.execute(
+            "SELECT definition FROM concepts WHERE subject=? AND context=?",
+            (subject, context))
+        row = self.cursor.fetchone()
+        return row[0] if row else None
+
+    def get_concepts_for_subject(self, subject):
+        """Get all concepts for a subject (across contexts). Returns list of (context, definition)."""
+        if not self._has_table("concepts"):
+            return []
+        self.cursor.execute(
+            "SELECT context, definition FROM concepts WHERE subject=?",
+            (subject,))
+        return [(r[0], r[1]) for r in self.cursor.fetchall()]
+
     # ── Core Methods ──────────────────────────────────────
 
     def add(self, subject, predicate, obj, truth_value="M",
+            context="general",
             evidence_for=None, evidence_against=None,
             source="unknown", generation=0, grade_level=0,
-            needs_verification=False, normalize=False):
-        """Add a triple. Returns row ID or None if duplicate."""
+            needs_verification=False, normalize=True):
+        """Add a triple with context. Returns row ID or None if duplicate."""
         if normalize:
             subject = self._normalize(subject)
             predicate = self._normalize(predicate)
             obj = self._normalize(obj)
             if not subject or not predicate or not obj:
                 return None
-        # Hash-accelerated duplicate detection
-        th = triple_hash(subject, predicate, obj)
+        # Hash-accelerated duplicate detection (includes context)
+        th = triple_hash(subject, context, predicate, obj)
         self.cursor.execute(
-            "SELECT id FROM entries WHERE triple_hash=? AND subject=? AND predicate=? AND object=?",
-            (th, subject, predicate, obj))
+            "SELECT id FROM entries WHERE triple_hash=? AND subject=? AND context=? AND predicate=? AND object=?",
+            (th, subject, context, predicate, obj))
         if self.cursor.fetchone():
             return None
         sh = fnv1a_64(subject)
+        ch = fnv1a_64(context)
         ph = fnv1a_64(predicate)
         oh = fnv1a_64(obj)
         self.cursor.execute("""
-            INSERT INTO entries (subject, predicate, object, truth_value,
+            INSERT INTO entries (subject, context, predicate, object, truth_value,
                 evidence_for, evidence_against, source, generation,
                 grade_level, needs_verification,
-                subject_hash, predicate_hash, object_hash, triple_hash)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (subject, predicate, obj, truth_value,
+                subject_hash, context_hash, predicate_hash, object_hash, triple_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (subject, context, predicate, obj, truth_value,
               json.dumps(evidence_for or []), json.dumps(evidence_against or []),
               source, generation, grade_level, int(needs_verification),
-              sh, ph, oh, th))
+              sh, ch, ph, oh, th))
         self.conn.commit()
         return self.cursor.lastrowid
 
@@ -238,7 +299,7 @@ class KnowledgeDB:
         if not text:
             return ""
         text = text.strip().lower()
-        text = re.sub(r'[^a-z0-9_\s-]', '', text)
+        text = re.sub(r'[^a-z0-9_,\s-]', '', text)
         text = re.sub(r'[\s-]+', '_', text)
         text = text.strip('_')
         return text[:100]
@@ -295,9 +356,9 @@ class KnowledgeDB:
         return (r or 0) + 1
 
     def signatures(self):
-        """Get set of all (subject, predicate, object) tuples."""
-        self.cursor.execute("SELECT subject, predicate, object FROM entries")
-        return {(r[0], r[1], r[2]) for r in self.cursor.fetchall()}
+        """Get set of all (subject, context, predicate, object) tuples."""
+        self.cursor.execute("SELECT subject, context, predicate, object FROM entries")
+        return {(r[0], r[1], r[2], r[3]) for r in self.cursor.fetchall()}
 
     def stats(self):
         """Print a summary of the database to stdout."""
@@ -392,11 +453,18 @@ class KnowledgeDB:
         except sqlite3.OperationalError:
             return self.search_multi(terms)
 
-    def get_neighbors(self, subject, depth=1):
-        """BFS graph walk from a subject, up to N hops. Returns unique entries."""
+    def get_neighbors(self, subject, depth=1, context=None):
+        """BFS graph walk from a subject, up to N hops. Returns unique entries.
+        If context is provided, only follows edges within that context (or 'general')."""
         visited = set()
         frontier = {subject.lower().replace(" ", "_")}
         all_entries = []
+
+        ctx_filter = ""
+        ctx_params = ()
+        if context:
+            ctx_filter = " AND (context=? OR context='general')"
+            ctx_params = (context,)
 
         for d in range(depth):
             next_frontier = set()
@@ -406,8 +474,8 @@ class KnowledgeDB:
                 visited.add(node)
 
                 self.cursor.execute(
-                    "SELECT * FROM entries WHERE subject=? AND truth_value='T'",
-                    (node,))
+                    "SELECT * FROM entries WHERE subject=? AND truth_value='T'" + ctx_filter,
+                    (node,) + ctx_params)
                 for r in self.cursor.fetchall():
                     entry = dict(r)
                     all_entries.append(entry)
@@ -416,8 +484,8 @@ class KnowledgeDB:
                         next_frontier.add(obj)
 
                 self.cursor.execute(
-                    "SELECT * FROM entries WHERE object=? AND truth_value='T'",
-                    (node,))
+                    "SELECT * FROM entries WHERE object=? AND truth_value='T'" + ctx_filter,
+                    (node,) + ctx_params)
                 for r in self.cursor.fetchall():
                     entry = dict(r)
                     all_entries.append(entry)
@@ -430,16 +498,23 @@ class KnowledgeDB:
         seen = set()
         unique = []
         for e in all_entries:
-            key = (e["subject"], e["predicate"], e["object"])
+            key = (e["subject"], e["context"], e["predicate"], e["object"])
             if key not in seen:
                 seen.add(key)
                 unique.append(e)
         return unique
 
-    def find_path(self, start, end, max_depth=5):
-        """BFS shortest path between two concepts."""
+    def find_path(self, start, end, max_depth=5, context=None):
+        """BFS shortest path between two concepts.
+        If context is provided, only follows edges within that context (or 'general')."""
         start = start.lower().replace(" ", "_")
         end = end.lower().replace(" ", "_")
+
+        ctx_filter = ""
+        ctx_params = ()
+        if context:
+            ctx_filter = " AND (context=? OR context='general')"
+            ctx_params = (context,)
 
         queue = deque([(start, [start])])
         visited = {start}
@@ -451,8 +526,8 @@ class KnowledgeDB:
 
             self.cursor.execute(
                 "SELECT subject, predicate, object FROM entries WHERE "
-                "(subject=? OR object=?) AND truth_value='T'",
-                (current, current))
+                "(subject=? OR object=?) AND truth_value='T'" + ctx_filter,
+                (current, current) + ctx_params)
 
             for row in self.cursor.fetchall():
                 s, p, o = row
@@ -472,24 +547,38 @@ class KnowledgeDB:
 
         return None
 
-    def get_about(self, subject):
-        """Get direct facts FROM a subject. Hash-accelerated."""
+    def get_about(self, subject, context=None):
+        """Get direct facts FROM a subject. Hash-accelerated.
+        If context is provided, filters to that context (or 'general')."""
         subject = subject.lower().replace(" ", "_")
         sh = fnv1a_64(subject)
-        self.cursor.execute(
-            "SELECT * FROM entries WHERE subject_hash=? AND subject=? AND truth_value='T' "
-            "AND object NOT LIKE '%,%'",
-            (sh, subject))
+        if context:
+            self.cursor.execute(
+                "SELECT * FROM entries WHERE subject_hash=? AND subject=? AND (context=? OR context='general') "
+                "AND truth_value='T' AND object NOT LIKE '%,%'",
+                (sh, subject, context))
+        else:
+            self.cursor.execute(
+                "SELECT * FROM entries WHERE subject_hash=? AND subject=? AND truth_value='T' "
+                "AND object NOT LIKE '%,%'",
+                (sh, subject))
         return [dict(r) for r in self.cursor.fetchall()]
 
-    def get_reverse(self, obj):
-        """What entries point TO this object? Hash-accelerated."""
+    def get_reverse(self, obj, context=None):
+        """What entries point TO this object? Hash-accelerated.
+        If context is provided, filters to that context (or 'general')."""
         obj = obj.lower().replace(" ", "_")
         oh = fnv1a_64(obj)
-        self.cursor.execute(
-            "SELECT * FROM entries WHERE object_hash=? AND object=? AND truth_value='T' "
-            "AND subject NOT LIKE '%,%'",
-            (oh, obj))
+        if context:
+            self.cursor.execute(
+                "SELECT * FROM entries WHERE object_hash=? AND object=? AND (context=? OR context='general') "
+                "AND truth_value='T' AND subject NOT LIKE '%,%'",
+                (oh, obj, context))
+        else:
+            self.cursor.execute(
+                "SELECT * FROM entries WHERE object_hash=? AND object=? AND truth_value='T' "
+                "AND subject NOT LIKE '%,%'",
+                (oh, obj))
         return [dict(r) for r in self.cursor.fetchall()]
 
     def get_unresolved(self, limit=30):

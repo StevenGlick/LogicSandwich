@@ -45,6 +45,28 @@ from bridges import BridgeSystem
 # QUERY ENGINE
 # ═══════════════════════════════════════════════════════════
 
+def _subject_display(subject, context, ambiguous_subjects):
+    """Format a subject for display, adding context only when ambiguous."""
+    if subject in ambiguous_subjects and context:
+        return f"{subject} ({context})"
+    return subject
+
+def _find_ambiguous_subjects(entries):
+    """Find subjects that appear in more than one context."""
+    subject_contexts = defaultdict(set)
+    for e in entries:
+        ctx = e.get("context")
+        if ctx:
+            subject_contexts[e["subject"]].add(ctx)
+    return {subj for subj, ctxs in subject_contexts.items() if len(ctxs) > 1}
+
+def _detect_query_context(parsed, search_terms, llm_available):
+    """Attempt to infer a domain context from the parsed question."""
+    if parsed and parsed.get("domain"):
+        return parsed["domain"]
+    return None
+
+
 class QueryEngine:
     def __init__(self, db, llm):
         self.db = db
@@ -85,13 +107,16 @@ class QueryEngine:
                           if w.lower().replace("?","") not in stop_words and len(w) > 2]
             print(f"  🔤 Extracted terms: {search_terms}")
         
+        # ── Detect domain context ──
+        query_context = _detect_query_context(parsed, search_terms, self.llm.available)
+
         # ── STEP 2: Search + Graph Walk (Logic layer) ──
         print(f"  🔍 Searching database...", end=" ", flush=True)
-        
+
         # Direct search (FTS5 with synonym expansion, falls back to LIKE)
         direct_results = self.db.search_fts(search_terms)
         print(f"{len(direct_results)} direct hits")
-        
+
         # Graph walk from top subjects
         graph_results = []
         subjects_found = set()
@@ -99,15 +124,16 @@ class QueryEngine:
             subj = entry["subject"]
             if "," not in subj and subj not in subjects_found:
                 subjects_found.add(subj)
-                neighbors = self.db.get_neighbors(subj, depth=1)
+                neighbors = self.db.get_neighbors(subj, depth=1, context=query_context)
                 graph_results.extend(neighbors)
         
-        # Deduplicate
-        seen_ids = set()
+        # Deduplicate by (subject, context, predicate, object)
+        seen_keys = set()
         all_facts = []
         for e in direct_results + graph_results:
-            if e["id"] not in seen_ids:
-                seen_ids.add(e["id"])
+            key = (e["subject"], e.get("context"), e["predicate"], e["object"])
+            if key not in seen_keys:
+                seen_keys.add(key)
                 all_facts.append(e)
         
         print(f"  📊 {len(all_facts)} total facts gathered ({len(direct_results)} direct + {len(graph_results)} via graph)")
@@ -138,8 +164,9 @@ class QueryEngine:
             for bt in new_terms:
                 extras = self.db.get_about(bt)
                 for e in extras:
-                    if e["id"] not in seen_ids:
-                        seen_ids.add(e["id"])
+                    key = (e["subject"], e.get("context"), e["predicate"], e["object"])
+                    if key not in seen_keys:
+                        seen_keys.add(key)
                         bridge_facts.append(e)
             if bridge_facts:
                 all_facts.extend(bridge_facts)
@@ -148,7 +175,7 @@ class QueryEngine:
         # Try to find paths between key subjects
         path = None
         if len(search_terms) >= 2:
-            path = self.db.find_path(search_terms[0], search_terms[1])
+            path = self.db.find_path(search_terms[0], search_terms[1], context=query_context)
             if path:
                 print(f"  🔗 Path: {' '.join(path)}")
         
@@ -160,7 +187,15 @@ class QueryEngine:
         
         if self.llm.available:
             print(f"  💡 Synthesizing answer...")
-            answer = self.llm.synthesize_answer(question, all_facts, path, unique_bridges)
+            # Format facts with context for the LLM
+            formatted_facts = []
+            for e in all_facts:
+                formatted_facts.append(
+                    f"  [{e['id']}] {e['subject']}({e.get('context','')}) "
+                    f"→ {e['predicate']}({e['object']}) [{e['truth_value']}]"
+                )
+            answer = self.llm.synthesize_answer(question, all_facts, path, unique_bridges,
+                                                formatted_facts=formatted_facts)
             if answer:
                 print(f"\n  {'═'*50}")
                 print(f"  ANSWER:")
@@ -187,25 +222,34 @@ class QueryEngine:
         print(f"\n  {'═'*50}")
         print(f"  RAW FACTS (no LLM available for synthesis):")
         print(f"  {'═'*50}")
-        
-        # Group by subject for readability
-        by_subject = defaultdict(list)
+
+        # Determine which subjects are ambiguous (appear in multiple contexts)
+        ambiguous = _find_ambiguous_subjects(all_facts)
+
+        # Group by (context, subject) for readability
+        by_context_subject = defaultdict(lambda: defaultdict(list))
         for e in all_facts:
             if "," not in e["subject"]:  # skip merged entries for display
-                by_subject[e["subject"]].append(e)
-        
-        for subj in sorted(by_subject.keys()):
-            entries = by_subject[subj]
-            print(f"\n  {subj}:")
-            for e in entries[:8]:
-                tv = {"T":"✓","F":"✗","M":"?"}[e["truth_value"]]
-                print(f"    [{tv}] → {e['predicate']}({e['object']})")
-                if e.get("evidence_for"):
-                    ev = json.loads(e["evidence_for"]) if isinstance(e["evidence_for"],str) else e["evidence_for"]
-                    if ev:
-                        print(f"        evidence: {ev[0][:60]}")
-            if len(entries) > 8:
-                print(f"    ... +{len(entries)-8} more")
+                ctx = e.get("context") or "general"
+                by_context_subject[ctx][e["subject"]].append(e)
+
+        for ctx in sorted(by_context_subject.keys()):
+            subjects = by_context_subject[ctx]
+            if len(by_context_subject) > 1:
+                print(f"\n  ── {ctx} ──")
+            for subj in sorted(subjects.keys()):
+                entries = subjects[subj]
+                display_name = _subject_display(subj, ctx, ambiguous)
+                print(f"\n  {display_name}:")
+                for e in entries[:8]:
+                    tv = {"T":"✓","F":"✗","M":"?"}[e["truth_value"]]
+                    print(f"    [{tv}] → {e['predicate']}({e['object']})")
+                    if e.get("evidence_for"):
+                        ev = json.loads(e["evidence_for"]) if isinstance(e["evidence_for"],str) else e["evidence_for"]
+                        if ev:
+                            print(f"        evidence: {ev[0][:60]}")
+                if len(entries) > 8:
+                    print(f"    ... +{len(entries)-8} more")
         
         if path:
             print(f"\n  Connection path: {' '.join(path)}")
@@ -227,24 +271,35 @@ class QueryEngine:
         """Direct database lookup — show everything about a term."""
         print(f"\n  Raw lookup: {term}")
         print(f"  {'─'*50}")
-        
+
         # As subject
         about = self.db.get_about(term)
         if about:
-            print(f"\n  {term} →")
+            # Determine ambiguous subjects across all results for this term
+            ambiguous = _find_ambiguous_subjects(about)
+            # Group by context for display
+            by_ctx = defaultdict(list)
             for e in about:
-                tv = {"T":"✓","F":"✗","M":"?"}[e["truth_value"]]
-                print(f"    [{tv}][{e['id']:4d}] {e['predicate']:25s} → {e['object']}")
-                src = e.get("source","")
-                if src: print(f"    {'':31s} source: {src}")
-        
+                by_ctx[e.get("context") or "general"].append(e)
+            for ctx in sorted(by_ctx.keys()):
+                entries = by_ctx[ctx]
+                display_name = _subject_display(term, ctx, ambiguous)
+                print(f"\n  {display_name} →")
+                for e in entries:
+                    tv = {"T":"✓","F":"✗","M":"?"}[e["truth_value"]]
+                    print(f"    [{tv}][{e['id']:4d}] {e['predicate']:25s} → {e['object']}")
+                    src = e.get("source","")
+                    if src: print(f"    {'':31s} source: {src}")
+
         # As object (what points to this?)
         reverse = self.db.get_reverse(term)
         if reverse:
+            ambiguous_rev = _find_ambiguous_subjects(reverse)
             print(f"\n  → {term}")
             for e in reverse:
                 tv = {"T":"✓","F":"✗","M":"?"}[e["truth_value"]]
-                print(f"    [{tv}][{e['id']:4d}] {e['subject']:25s} ← {e['predicate']}")
+                subj_display = _subject_display(e["subject"], e.get("context"), ambiguous_rev)
+                print(f"    [{tv}][{e['id']:4d}] {subj_display:25s} ← {e['predicate']}")
         
         if not about and not reverse:
             print(f"  Nothing found for '{term}'")
@@ -265,12 +320,12 @@ class QueryEngine:
                 if b.get("reason"):
                     print(f"       {b['reason'][:80]}")
 
-    def show_graph(self, term, depth=2):
+    def show_graph(self, term, depth=2, context=None):
         """Show the knowledge graph around a term."""
         print(f"\n  Graph around '{term}' (depth {depth}):")
         print(f"  {'─'*50}")
-        
-        entries = self.db.get_neighbors(term, depth)
+
+        entries = self.db.get_neighbors(term, depth, context=context)
         if not entries:
             print(f"  Nothing found")
             return
@@ -317,12 +372,12 @@ class QueryEngine:
         
         show_node(root)
     
-    def show_path(self, start, end):
+    def show_path(self, start, end, context=None):
         """Find and display path between two concepts."""
         print(f"\n  Finding path: {start} → ... → {end}")
         print(f"  {'─'*50}")
-        
-        path = self.db.find_path(start, end)
+
+        path = self.db.find_path(start, end, context=context)
         if path:
             print(f"\n  ", end="")
             for i, step in enumerate(path):
@@ -446,9 +501,11 @@ def show_unresolved(db):
         print(f"\n  All entries resolved!")
         return
     total_m = db.count("M")
+    ambiguous = _find_ambiguous_subjects(unresolved)
     print(f"\n  ? UNRESOLVED ({total_m} total, showing 30)")
     for e in unresolved:
-        print(f"    [{e['id']:4d}] {e['subject']} → {e['predicate']}({e['object']})")
+        display_name = _subject_display(e["subject"], e.get("context"), ambiguous)
+        print(f"    [{e['id']:4d}] {display_name} → {e['predicate']}({e['object']})")
 
 
 # ═══════════════════════════════════════════════════════════

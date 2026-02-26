@@ -350,56 +350,92 @@ def compute_centrality(conn):
 def build_fts_index(conn):
     """
     Build a full-text search index over the knowledge base.
-    
+
     FTS5 lets you search with:
       - Simple terms: "weather"
-      - Phrases: "nuclear fusion" 
+      - Phrases: "nuclear fusion"
       - Prefix: "photo*" (matches photosynthesis, photography...)
       - Boolean: "rain OR snow"
       - Near: NEAR("sun" "energy", 5)
     """
     cur = conn.cursor()
-    
+
+    # Check if entries table has a context column
+    has_context = False
+    try:
+        cur.execute("SELECT context FROM entries LIMIT 1")
+        has_context = True
+    except Exception:
+        pass
+
     # Drop and rebuild (FTS tables can't be altered)
-    cur.executescript("""
-        DROP TABLE IF EXISTS entries_fts;
-        CREATE VIRTUAL TABLE entries_fts USING fts5(
-            entry_id,
-            subject,
-            predicate,
-            object,
-            evidence,
-            source,
-            content='',
-            tokenize='porter unicode61'
-        );
-    """)
+    if has_context:
+        cur.executescript("""
+            DROP TABLE IF EXISTS entries_fts;
+            CREATE VIRTUAL TABLE entries_fts USING fts5(
+                entry_id,
+                subject,
+                predicate,
+                object,
+                context,
+                evidence,
+                source,
+                content='',
+                tokenize='porter unicode61'
+            );
+        """)
+    else:
+        cur.executescript("""
+            DROP TABLE IF EXISTS entries_fts;
+            CREATE VIRTUAL TABLE entries_fts USING fts5(
+                entry_id,
+                subject,
+                predicate,
+                object,
+                evidence,
+                source,
+                content='',
+                tokenize='porter unicode61'
+            );
+        """)
     # porter = stemming (searches → search, running → run)
     # unicode61 = handles accented characters
-    
+
     # Populate
-    cur.execute("""
-        SELECT id, subject, predicate, object, evidence_for, source 
-        FROM entries WHERE truth_value='T'
-    """)
-    
+    if has_context:
+        cur.execute("""
+            SELECT id, subject, predicate, object, context, evidence_for, source
+            FROM entries WHERE truth_value='T'
+        """)
+    else:
+        cur.execute("""
+            SELECT id, subject, predicate, object, NULL, evidence_for, source
+            FROM entries WHERE truth_value='T'
+        """)
+
     count = 0
     for row in cur.fetchall():
         # Expand underscores to spaces for better text matching
         subj = row[1].replace("_", " ")
         pred = row[2].replace("_", " ")
         obj = row[3].replace("_", " ")
-        evidence = row[4].replace("_", " ") if row[4] else ""
-        source = row[5] or ""
-        
-        cur.execute(
-            "INSERT INTO entries_fts (entry_id, subject, predicate, object, evidence, source) VALUES (?,?,?,?,?,?)",
-            (str(row[0]), subj, pred, obj, evidence, source))
+        ctx = (row[4] or "").replace("_", " ") if has_context else ""
+        evidence = row[5].replace("_", " ") if row[5] else ""
+        source = row[6] or ""
+
+        if has_context:
+            cur.execute(
+                "INSERT INTO entries_fts (entry_id, subject, predicate, object, context, evidence, source) VALUES (?,?,?,?,?,?,?)",
+                (str(row[0]), subj, pred, obj, ctx, evidence, source))
+        else:
+            cur.execute(
+                "INSERT INTO entries_fts (entry_id, subject, predicate, object, evidence, source) VALUES (?,?,?,?,?,?)",
+                (str(row[0]), subj, pred, obj, evidence, source))
         count += 1
-    
+
     conn.commit()
-    print(f"  FTS index: {count} entries indexed")
-    
+    print(f"  FTS index: {count} entries indexed" + (" (with context)" if has_context else ""))
+
     # Test it
     test_queries = ["weather", "energy", "animal", "chemical"]
     for q in test_queries:
@@ -408,7 +444,7 @@ def build_fts_index(conn):
         hits = cur.fetchone()[0]
         if hits > 0:
             print(f"    test '{q}': {hits} hits")
-    
+
     return count
 
 
@@ -544,11 +580,13 @@ DOMAIN_KEYWORDS = {
 
 def cluster_domains(conn):
     """
-    Assign domain labels to entries based on keyword matching.
+    Assign domain labels to entries based on the context column when available,
+    falling back to keyword matching for entries with context='general' or
+    databases without a context column.
     An entry can belong to multiple domains.
     """
     cur = conn.cursor()
-    
+
     cur.executescript("""
         CREATE TABLE IF NOT EXISTS entry_domains (
             entry_id INTEGER NOT NULL,
@@ -559,10 +597,41 @@ def cluster_domains(conn):
         CREATE INDEX IF NOT EXISTS idx_domain ON entry_domains(domain);
         DELETE FROM entry_domains;
     """)
-    
-    # For each domain, find entries matching its keywords
+
+    # Check if entries table has a context column
+    has_context = False
+    try:
+        cur.execute("SELECT context FROM entries LIMIT 1")
+        has_context = True
+    except Exception:
+        pass
+
     domain_counts = {}
-    
+
+    if has_context:
+        # Phase 1: Use context column directly for entries that have a specific context
+        cur.execute("""
+            SELECT id, context FROM entries
+            WHERE truth_value='T' AND context IS NOT NULL AND context != 'general' AND context != 'cross_domain'
+        """)
+        context_assigned = 0
+        for row in cur.fetchall():
+            eid, ctx = row[0], row[1]
+            cur.execute(
+                "INSERT OR IGNORE INTO entry_domains (entry_id, domain, confidence) VALUES (?,?,1.0)",
+                (eid, ctx))
+            context_assigned += 1
+            domain_counts[ctx] = domain_counts.get(ctx, 0) + 1
+
+        if context_assigned > 0:
+            print(f"  Context-based assignment: {context_assigned} entries from context column")
+
+        # Phase 2: Fall back to keyword matching for 'general' and 'cross_domain' entries
+        fallback_where = "AND (context = 'general' OR context = 'cross_domain' OR context IS NULL)"
+    else:
+        fallback_where = ""
+
+    # Keyword-based matching (all entries if no context column, or only general/cross_domain)
     for domain, keywords in DOMAIN_KEYWORDS.items():
         # Build SQL LIKE conditions with word-boundary awareness
         # Use underscore boundaries to avoid "ion" matching "animation"
@@ -575,28 +644,28 @@ def cluster_domains(conn):
                 " OR object = ? OR object LIKE ? OR object LIKE ? OR object LIKE ?)")
             params.extend([kw, f"{kw}_%", f"%_{kw}", f"%_{kw}_%",
                           kw, f"{kw}_%", f"%_{kw}", f"%_{kw}_%"])
-        
+
         where = " OR ".join(conditions)
         cur.execute(f"""
-            SELECT id FROM entries WHERE truth_value='T' AND ({where})
+            SELECT id FROM entries WHERE truth_value='T' {fallback_where} AND ({where})
         """, params)
-        
+
         ids = [r[0] for r in cur.fetchall()]
         for eid in ids:
             cur.execute(
                 "INSERT OR IGNORE INTO entry_domains (entry_id, domain) VALUES (?,?)",
                 (eid, domain))
-        
-        domain_counts[domain] = len(ids)
-    
+
+        domain_counts[domain] = domain_counts.get(domain, 0) + len(ids)
+
     conn.commit()
-    
+
     print(f"  Domain clusters:")
     for domain in sorted(domain_counts, key=domain_counts.get, reverse=True):
         cnt = domain_counts[domain]
         bar = "█" * min(cnt//3, 30)
         print(f"    {domain:15s} {cnt:5d} entries {bar}")
-    
+
     return domain_counts
 
 

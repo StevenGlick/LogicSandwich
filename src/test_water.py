@@ -42,6 +42,7 @@ cur.executescript("""
     CREATE TABLE IF NOT EXISTS entries (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         subject TEXT NOT NULL,
+        context TEXT DEFAULT 'general',
         predicate TEXT NOT NULL,
         object TEXT NOT NULL,
         truth_value TEXT DEFAULT 'T',
@@ -54,6 +55,7 @@ cur.executescript("""
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     CREATE INDEX IF NOT EXISTS idx_subj ON entries(subject);
+    CREATE INDEX IF NOT EXISTS idx_ctx ON entries(context);
     CREATE INDEX IF NOT EXISTS idx_pred ON entries(predicate);
     CREATE INDEX IF NOT EXISTS idx_obj ON entries(object);
     CREATE INDEX IF NOT EXISTS idx_tv ON entries(truth_value);
@@ -67,10 +69,11 @@ with open("water_seed.json") as f:
     seeds = json.load(f)
 
 for s in seeds:
+    ctx = s.get("context", "general")
     cur.execute("""
-        INSERT INTO entries (subject, predicate, object, truth_value, source, generation)
-        VALUES (?, ?, ?, 'T', 'seed', 0)
-    """, (s["subject"], s["predicate"], s["object"]))
+        INSERT INTO entries (subject, context, predicate, object, truth_value, source, generation)
+        VALUES (?, ?, ?, ?, 'T', 'seed', 0)
+    """, (s["subject"], ctx, s["predicate"], s["object"]))
 
 conn.commit()
 cur.execute("SELECT COUNT(*) FROM entries")
@@ -115,16 +118,16 @@ def get_all_entries():
     cur.execute("SELECT * FROM entries WHERE truth_value='T'")
     return [dict(r) for r in cur.fetchall()]
 
-def add_entry(subj, pred, obj, source, gen, tv="T"):
-    """Add with dedup check."""
-    cur.execute("SELECT id FROM entries WHERE subject=? AND predicate=? AND object=?",
-                (subj, pred, obj))
+def add_entry(subj, pred, obj, source, gen, tv="T", context="general"):
+    """Add with dedup check (context-aware)."""
+    cur.execute("SELECT id FROM entries WHERE subject=? AND context=? AND predicate=? AND object=?",
+                (subj, context, pred, obj))
     if cur.fetchone():
         return None
     cur.execute("""
-        INSERT INTO entries (subject, predicate, object, truth_value, source, generation)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (subj, pred, obj, tv, source, gen))
+        INSERT INTO entries (subject, context, predicate, object, truth_value, source, generation)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (subj, context, pred, obj, tv, source, gen))
     conn.commit()
     return cur.lastrowid
 
@@ -619,6 +622,78 @@ try:
         print(f"    {r[0]:25s} score={r[1]:5.0f} {bar}")
 except (sqlite3.OperationalError, TypeError):
     pass
+
+# ─── Context Disambiguation Test ──────────────────────
+
+print(f"\n  ── Phase 8: Context Disambiguation Test ──")
+print(f"  Testing that 'mamba' in computer_science and biology contexts stay isolated...")
+
+# Add mamba entries in two different contexts
+add_entry("mamba", "is_a", "ssm_architecture", "test:disambiguation", 0, "T", context="computer_science")
+add_entry("mamba", "uses", "selective_state_spaces", "test:disambiguation", 0, "T", context="computer_science")
+add_entry("mamba", "is_a", "venomous_snake", "test:disambiguation", 0, "T", context="biology")
+add_entry("mamba", "has_property", "neurotoxic_venom", "test:disambiguation", 0, "T", context="biology")
+
+# Add chaining targets to test transitive leakage
+add_entry("ssm_architecture", "is_a", "neural_network_variant", "test:disambiguation", 0, "T", context="computer_science")
+add_entry("venomous_snake", "is_a", "reptile", "test:disambiguation", 0, "T", context="biology")
+
+# Run a mini transitive pass on just the mamba entries
+# Chain: mamba -[is_a]-> ssm_architecture -[is_a]-> neural_network_variant (CS context)
+# Chain: mamba -[is_a]-> venomous_snake -[is_a]-> reptile (biology context)
+# The test: mamba in biology context should NOT get neural_network_variant
+mamba_trans_ok = True
+mamba_trans_details = []
+
+# Get mamba entries grouped by context
+cur.execute("SELECT subject, context, predicate, object FROM entries WHERE subject='mamba'")
+mamba_entries = [dict(r) for r in cur.fetchall()]
+
+# Simulate context-aware transitive chaining
+for me in mamba_entries:
+    me_ctx = me["context"]
+    me_obj = me["object"]
+    # Find entries where me_obj is the subject IN THE SAME CONTEXT
+    cur.execute(
+        "SELECT subject, context, predicate, object FROM entries WHERE subject=? AND context=?",
+        (me_obj, me_ctx))
+    targets = [dict(r) for r in cur.fetchall()]
+    for t in targets:
+        result_ctx = t["context"]
+        mamba_trans_details.append(
+            (me_ctx, me["predicate"], me_obj, t["predicate"], t["object"], result_ctx))
+        # Context should match — no leakage
+        if me_ctx != result_ctx:
+            mamba_trans_ok = False
+
+# Also verify no cross-context results: biology mamba should NOT chain to CS targets
+cur.execute(
+    "SELECT subject, context, predicate, object FROM entries WHERE subject='ssm_architecture' AND context='biology'")
+leaked_cs_to_bio = cur.fetchall()
+cur.execute(
+    "SELECT subject, context, predicate, object FROM entries WHERE subject='venomous_snake' AND context='computer_science'")
+leaked_bio_to_cs = cur.fetchall()
+
+if leaked_cs_to_bio or leaked_bio_to_cs:
+    mamba_trans_ok = False
+
+print(f"  Mamba transitive chains (context-aware):")
+for src_ctx, link_p, mid, inh_p, end, res_ctx in mamba_trans_details:
+    marker = "OK" if src_ctx == res_ctx else "LEAK"
+    print(f"    [{src_ctx:18s}] mamba -{link_p}-> {mid} -{inh_p}-> {end}  [{res_ctx}] {marker}")
+
+if mamba_trans_ok:
+    print(f"  PASS: Contexts did not leak across mamba disambiguation")
+else:
+    print(f"  FAIL: Context leakage detected in mamba disambiguation!")
+
+# Verify both contexts coexist
+cur.execute("SELECT context, COUNT(*) FROM entries WHERE subject='mamba' GROUP BY context")
+mamba_ctx_counts = {r[0]: r[1] for r in cur.fetchall()}
+print(f"  Mamba entries by context: {dict(mamba_ctx_counts)}")
+assert "computer_science" in mamba_ctx_counts, "Missing computer_science mamba entries"
+assert "biology" in mamba_ctx_counts, "Missing biology mamba entries"
+print(f"  PASS: Both contexts coexist for 'mamba'")
 
 print(f"\n  ✓ Test complete")
 

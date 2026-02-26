@@ -242,8 +242,15 @@ class PredicateRuleLearner:
         """)
         self.db.conn.commit()
 
-    def record_outcome(self, link_pred, inherited_pred, approved):
-        """Record a verification outcome for a predicate pair."""
+    def record_outcome(self, link_pred, inherited_pred, approved, context=None):
+        """Record a verification outcome for a predicate pair.
+
+        Args:
+            link_pred: The link predicate in the chain A --[link]--> B
+            inherited_pred: The inherited predicate B --[inherited]--> C
+            approved: Whether the chain was approved (True) or rejected (False)
+            context: Optional context tag (future-proofing for context-aware rules)
+        """
         link = link_pred.lower()
         inherited = inherited_pred.lower()
         col = "approved_count" if approved else "rejected_count"

@@ -269,6 +269,9 @@ DOMAIN_COMPAT = {}
 for d, info in DOMAINS.items():
     DOMAIN_COMPAT[d] = set(info["compatible"]) | {d}  # always compatible with self
 
+# Controlled vocabulary for context field — every entry's context must be one of these
+VALID_CONTEXTS = frozenset(DOMAINS.keys()) | {"cross_domain", "general"}
+
 
 # ═══════════════════════════════════════════════════════════
 # DOMAIN CLASSIFIER
@@ -426,6 +429,18 @@ class DomainClassifier:
         
         return False
     
+    def classify_context(self, term):
+        """Return single best-match domain for use as entry context.
+        Prefers specific domains over 'everyday'. Never returns empty."""
+        domains = self.classify(term)
+        if not domains:
+            return "general"
+        # Prefer non-'everyday' if available (more specific)
+        specific = domains - {"everyday"}
+        if specific:
+            return sorted(specific)[0]  # deterministic
+        return sorted(domains)[0]
+
     def compatibility_score(self, term_a, term_b):
         """
         Return 0.0-1.0 score of how compatible two terms are.

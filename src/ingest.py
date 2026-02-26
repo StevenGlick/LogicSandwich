@@ -32,7 +32,8 @@ Feeds knowledge into the pulse system from multiple sources:
    - The agent loop picks them up and processes them
 
 USAGE:
-  python3 ingest.py --textbook path/to/file.txt      # ingest a text file
+  python3 ingest.py --json path/to/seed.json          # ingest a JSON seed file
+  python3 ingest.py --textbook path/to/file.txt       # ingest a text file
   python3 ingest.py --textbook-dir path/to/folder/    # ingest all .txt files
   python3 ingest.py --wikipedia path/to/dump.xml.bz2  # ingest wikipedia
   python3 ingest.py --wikidata path/to/wikidata.json  # ingest wikidata
@@ -56,6 +57,7 @@ from collections import defaultdict
 # ═══════════════════════════════════════════════════════════
 from db import KnowledgeDB
 from llm import create_llm
+from domain_scope import DomainClassifier
 
 # ═══════════════════════════════════════════════════════════
 # TEXT CHUNKER
@@ -113,11 +115,11 @@ def ingest_textbook(db, llm, filepath, grade_level=0):
     4. Add resulting facts to database
     """
     print(f"\n  📖 Ingesting: {filepath}")
-    
+
     if not llm.available:
         print("    ⚠ No LLM available. Cannot decompose text.")
         return 0
-    
+
     # Read file
     try:
         with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
@@ -125,31 +127,42 @@ def ingest_textbook(db, llm, filepath, grade_level=0):
     except Exception as e:
         print(f"    ⚠ Error reading file: {e}")
         return 0
-    
+
     print(f"    Size: {len(text):,} characters")
-    
+
     # Chunk
     chunks = chunk_text(text)
     print(f"    Chunks: {len(chunks)}")
-    
+
+    # Auto-classify context from filename
+    classifier = DomainClassifier()
+    filename = os.path.basename(filepath)
+    stem = os.path.splitext(filename)[0].replace("_", " ").replace("-", " ")
+    default_context = classifier.classify_context(stem)
+
     # Process each chunk
     total_facts = 0
     errors = 0
-    filename = os.path.basename(filepath)
-    
+
     for i, chunk in enumerate(chunks):
         # Skip very short chunks
         if len(chunk) < 50:
             continue
-        
+
         print(f"    Chunk {i+1}/{len(chunks)} ({len(chunk)} chars)...", end=" ", flush=True)
-        
+
         try:
-            facts = llm.decompose_text(chunk, context=f"From: {filename}")
+            facts = llm.decompose_text(
+                chunk,
+                context=f"From: {filename} (domain: {default_context})")
             added = 0
             for fact in facts:
+                # Per-fact context: classify subject, fall back to file-level default
+                fact_context = classifier.classify_context(fact["subject"]) \
+                    if fact.get("subject") else default_context
                 result = db.add(
                     fact["subject"], fact["predicate"], fact["object"], "T",
+                    context=fact_context,
                     evidence_for=[f"textbook: {filename}, chunk {i+1}"],
                     source=f"textbook:{filename}",
                     generation=0, grade_level=grade_level,
@@ -161,10 +174,10 @@ def ingest_textbook(db, llm, filepath, grade_level=0):
         except Exception as e:
             print(f"ERROR: {e}")
             errors += 1
-        
+
         # Brief pause to not overwhelm Ollama
         time.sleep(0.5)
-    
+
     db.log_ingest("textbook", filepath, len(chunks), total_facts, errors)
     print(f"\n    ✓ Complete: {total_facts} facts added from {len(chunks)} chunks")
     return total_facts
@@ -187,6 +200,79 @@ def ingest_textbook_dir(db, llm, dirpath, grade_level=0):
         total += ingest_textbook(db, llm, os.path.join(dirpath, f), grade_level)
     
     return total
+
+
+# ═══════════════════════════════════════════════════════════
+# JSON SEED INGESTION
+# ═══════════════════════════════════════════════════════════
+
+def ingest_json(db, filepath):
+    """
+    Ingest a JSON seed file with context-awareness.
+
+    Supports two formats:
+    1. Dict with "entries" key (preferred):
+       {
+         "default_context": "chemistry",
+         "concepts": [{"subject": ..., "context": ..., "definition": ...}],
+         "entries": [{"subject": ..., "predicate": ..., "object": ..., "context": ...}]
+       }
+    2. Plain list of entry dicts (legacy):
+       [{"subject": ..., "predicate": ..., "object": ...}, ...]
+    """
+    print(f"\n  📦 Ingesting JSON seed: {filepath}")
+
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"    ⚠ Error reading JSON: {e}")
+        return 0
+
+    # Determine format and extract parts
+    if isinstance(data, dict) and "entries" in data:
+        default_context = data.get("default_context", "general")
+        concepts = data.get("concepts", [])
+        entries = data["entries"]
+    elif isinstance(data, list):
+        default_context = "general"
+        concepts = []
+        entries = data
+    else:
+        print(f"    ⚠ Unrecognized JSON format (expected dict with 'entries' or list)")
+        return 0
+
+    print(f"    Default context: {default_context}")
+    print(f"    Concepts: {len(concepts)}")
+    print(f"    Entries: {len(entries)}")
+
+    # Load concepts if present
+    if concepts:
+        db.enable_concepts()
+        concept_count = 0
+        for c in concepts:
+            if db.add_concept(c["subject"], c["context"], c["definition"]):
+                concept_count += 1
+        print(f"    Loaded {concept_count} concepts")
+
+    # Load entries
+    total_added = 0
+    for entry in entries:
+        ctx = entry.get("context", default_context)
+        result = db.add(
+            entry["subject"], entry["predicate"], entry["object"],
+            entry.get("truth_value", "T"),
+            context=ctx,
+            evidence_for=entry.get("evidence_for", [f"seed:{os.path.basename(filepath)}"]),
+            source=entry.get("source", "seed"),
+            generation=entry.get("generation", 0),
+            normalize=True)
+        if result:
+            total_added += 1
+
+    db.log_ingest("json_seed", filepath, len(entries), total_added, 0)
+    print(f"    ✓ {total_added} entries added from {len(entries)} in file")
+    return total_added
 
 
 # ═══════════════════════════════════════════════════════════
@@ -215,97 +301,102 @@ def ingest_wikipedia(db, llm, path, max_articles=1000):
         print("    TIP: For Wikipedia, consider using Wikidata instead (already structured)")
         return 0
     
+    classifier = DomainClassifier()
     total_facts = 0
     articles_processed = 0
-    
+
     if os.path.isdir(path):
         # WikiExtractor output: directories of text files
         for root, dirs, files in os.walk(path):
             for fname in sorted(files):
                 if articles_processed >= max_articles:
                     break
-                
+
                 fpath = os.path.join(root, fname)
                 try:
                     with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
                         content = f.read()
                 except IOError:
                     continue
-                
+
                 # WikiExtractor format: <doc id="..." url="..." title="...">content</doc>
                 # Extract articles
                 articles = re.findall(
-                    r'<doc[^>]*title="([^"]*)"[^>]*>(.*?)</doc>', 
+                    r'<doc[^>]*title="([^"]*)"[^>]*>(.*?)</doc>',
                     content, re.DOTALL)
-                
+
                 if not articles:
                     # Plain text file, treat as single article
                     articles = [(fname, content)]
-                
+
                 for title, text in articles:
                     if articles_processed >= max_articles:
                         break
-                    
+
                     text = text.strip()
                     if len(text) < 100:
                         continue
-                    
+
                     print(f"    [{articles_processed+1}] {title[:50]}...", end=" ", flush=True)
-                    
+
                     # Take first ~3000 chars (summary + intro usually)
                     excerpt = text[:3000]
                     chunks = chunk_text(excerpt, chunk_size=1500)
-                    
+
                     article_facts = 0
                     for chunk in chunks[:3]:  # Max 3 chunks per article
                         facts = llm.decompose_text(chunk, context=f"Wikipedia: {title}")
                         for fact in facts:
+                            ctx = classifier.classify_context(fact["subject"])
                             result = db.add(
                                 fact["subject"], fact["predicate"], fact["object"], "T",
+                                context=ctx,
                                 evidence_for=[f"wikipedia: {title}"],
                                 source="wikipedia",
                                 generation=0,
-                    normalize=True)
+                                normalize=True)
                             if result:
                                 article_facts += 1
                         time.sleep(0.3)
-                    
+
                     total_facts += article_facts
                     articles_processed += 1
                     print(f"+{article_facts} facts")
-    
+
     elif os.path.isfile(path):
         # Single text file — split on double newlines or headers
         with open(path, 'r', encoding='utf-8', errors='replace') as f:
             content = f.read()
-        
+
         # Try to split into sections
         sections = re.split(r'\n={2,}\s*\n|\n\n\n+', content)
-        
+
         for section in sections:
             if articles_processed >= max_articles:
                 break
             section = section.strip()
             if len(section) < 100:
                 continue
-            
+
             title = section[:50].split('\n')[0]
             print(f"    [{articles_processed+1}] {title}...", end=" ", flush=True)
-            
+
             chunks = chunk_text(section, chunk_size=1500)
             article_facts = 0
             for chunk in chunks[:3]:
                 facts = llm.decompose_text(chunk, context="Wikipedia article")
                 for fact in facts:
+                    ctx = classifier.classify_context(fact["subject"])
                     result = db.add(
                         fact["subject"], fact["predicate"], fact["object"], "T",
+                        context=ctx,
                         evidence_for=["wikipedia"],
                         source="wikipedia", generation=0,
-                    normalize=True)
+                        normalize=True)
                     if result:
                         article_facts += 1
                 time.sleep(0.3)
-            
+
             total_facts += article_facts
             articles_processed += 1
             print(f"+{article_facts} facts")
@@ -389,49 +480,51 @@ def ingest_wikidata(db, path, max_entities=50000, language="en"):
     print(f"    Max entities: {max_entities:,}")
     print(f"    NO LLM needed — data is pre-structured!")
     
+    classifier = DomainClassifier()
     total_facts = 0
     entities_processed = 0
-    
+
     # Detect format
     is_bz2 = path.endswith('.bz2')
     opener = bz2.open if is_bz2 else open
-    
+
     try:
         with opener(path, 'rt', encoding='utf-8') as f:
             for line in f:
                 if entities_processed >= max_entities:
                     break
-                
+
                 line = line.strip().rstrip(',')
                 if not line or line in ('[', ']'):
                     continue
-                
+
                 try:
                     entity = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                
+
                 # Get English label
                 labels = entity.get("labels", {})
                 en_label = labels.get(language, {}).get("value", "")
                 if not en_label:
                     continue
-                
+
                 subject = en_label.lower().replace(" ", "_")
-                
+                ctx = classifier.classify_context(subject)
+
                 # Extract claims (the actual triples!)
                 claims = entity.get("claims", {})
                 entity_facts = 0
-                
+
                 for prop_id, claim_list in claims.items():
                     predicate = WIKIDATA_PROPERTIES.get(prop_id)
                     if not predicate:
                         continue  # skip unknown properties
-                    
+
                     for claim in claim_list:
                         mainsnak = claim.get("mainsnak", {})
                         datavalue = mainsnak.get("datavalue", {})
-                        
+
                         # Handle entity references (most common)
                         if datavalue.get("type") == "wikibase-entityid":
                             obj_id = datavalue["value"].get("id", "")
@@ -448,15 +541,16 @@ def ingest_wikidata(db, path, max_entities=50000, language="en"):
                                 continue
                         else:
                             continue
-                        
+
                         if obj:
                             result = db.add(
-                                subject, predicate, 
+                                subject, predicate,
                                 obj.lower().replace(" ", "_"),
                                 "T",
+                                context=ctx,
                                 evidence_for=[f"wikidata:{entity.get('id','')}"],
                                 source="wikidata",
-                    normalize=True)
+                                normalize=True)
                             if result:
                                 entity_facts += 1
                                 total_facts += 1
@@ -538,43 +632,44 @@ def ingest_conceptnet(db, path, max_edges=100000, language="en", min_weight=1.0)
     print(f"    Min weight: {min_weight}")
     print(f"    NO LLM needed — commonsense knowledge, pre-structured!")
     
+    classifier = DomainClassifier()
     total_facts = 0
     edges_processed = 0
-    
+
     is_gz = path.endswith('.gz')
     opener = gzip.open if is_gz else open
     mode = 'rt' if is_gz else 'r'
-    
+
     try:
         with opener(path, mode, encoding='utf-8') as f:
             for line in f:
                 if edges_processed >= max_edges:
                     break
-                
+
                 parts = line.strip().split('\t')
                 if len(parts) < 5:
                     continue
-                
+
                 relation = parts[1]
                 subj_uri = parts[2]
                 obj_uri = parts[3]
-                
+
                 # Filter to English only
                 if f"/c/{language}/" not in subj_uri or f"/c/{language}/" not in obj_uri:
                     continue
-                
+
                 # Map relation
                 predicate = CONCEPTNET_RELATIONS.get(relation)
                 if not predicate:
                     continue
-                
+
                 # Extract terms from URIs: /c/en/dog → dog
                 try:
                     subject = subj_uri.split(f"/c/{language}/")[1].split("/")[0]
                     obj = obj_uri.split(f"/c/{language}/")[1].split("/")[0]
                 except (IndexError, ValueError):
                     continue
-                
+
                 # Check weight
                 try:
                     meta = json.loads(parts[4])
@@ -583,11 +678,13 @@ def ingest_conceptnet(db, path, max_edges=100000, language="en", min_weight=1.0)
                         continue
                 except (json.JSONDecodeError, IndexError, TypeError):
                     continue
-                
+
                 # Add to database
+                ctx = classifier.classify_context(subject)
                 result = db.add(
                     subject.replace("_", "_"), predicate, obj.replace("_", "_"),
                     "T",
+                    context=ctx,
                     evidence_for=[f"conceptnet:weight={weight:.1f}"],
                     source="conceptnet",
                     normalize=True)
@@ -630,27 +727,29 @@ def run_agent_loop(db, llm):
     print(f"    Watching agent_queue table in {db.db_path}")
     print(f"    Add tasks from another script or the dashboard")
     print(f"    Ctrl+C to stop\n")
-    
+
     if not llm.available:
         print("    ⚠ No LLM. Can only process 'decompose' tasks with text files.")
-    
+
+    classifier = DomainClassifier()
+
     while True:
         task = db.get_next_task()
-        
+
         if not task:
             time.sleep(2)  # poll every 2 seconds
             continue
-        
+
         task_type = task["task_type"]
         payload = task["payload"]
-        
+
         try:
             payload_data = json.loads(payload) if payload.startswith('{') else {"text": payload}
         except (json.JSONDecodeError, AttributeError):
             payload_data = {"text": payload}
-        
+
         print(f"  📋 Task #{task['id']}: {task_type} — {str(payload_data)[:60]}")
-        
+
         if task_type == "research" and llm.available:
             # Generate facts about a topic
             topic = payload_data.get("topic", payload_data.get("text", ""))
@@ -665,16 +764,18 @@ Use lowercase_with_underscores."""
                     if "|" not in line: continue
                     parts = [p.strip() for p in line.split("|")]
                     if len(parts) >= 3:
+                        ctx = classifier.classify_context(parts[0])
                         if db.add(parts[0],parts[1],parts[2],"T",
+                            context=ctx,
                             evidence_for=[f"agent research: {topic}"],
                             source="agent:research",
-                    normalize=True):
+                            normalize=True):
                             count += 1
                 db.complete_task(task["id"], f"added {count} facts")
                 print(f"    → +{count} facts about '{topic}'")
             else:
                 db.complete_task(task["id"], "llm unavailable")
-        
+
         elif task_type == "question" and llm.available:
             question = payload_data.get("question", payload_data.get("text", ""))
             system = """Answer this question by producing atomic facts.
@@ -693,24 +794,28 @@ Also: CONFUSED: thing_a|thing_b|reason (if applicable)"""
                         db.conn.commit()
                     elif len(parts) >= 3:
                         tv = parts[3].upper() if len(parts)>3 and parts[3].upper() in "TFM" else "T"
+                        ctx = classifier.classify_context(parts[0])
                         if db.add(parts[0],parts[1],parts[2],tv,
+                            context=ctx,
                             evidence_for=[f"agent Q&A: {question}"],
                             source="agent:question",
-                    normalize=True):
+                            normalize=True):
                             count += 1
                 db.complete_task(task["id"], f"added {count} facts")
                 print(f"    → +{count} facts from question")
-        
+
         elif task_type == "decompose":
             text = payload_data.get("text", "")
             if llm.available and text:
                 facts = llm.decompose_text(text)
                 count = 0
                 for f in facts:
+                    ctx = classifier.classify_context(f["subject"])
                     if db.add(f["subject"],f["predicate"],f["object"],"T",
+                        context=ctx,
                         evidence_for=["agent decomposition"],
                         source="agent:decompose",
-                    normalize=True):
+                        normalize=True):
                         count += 1
                 db.complete_task(task["id"], f"added {count} facts")
                 print(f"    → +{count} facts from decomposition")
@@ -759,6 +864,7 @@ def main():
     parser.add_argument("--api-key", default=None, help="Claude API key (or set ANTHROPIC_API_KEY)")
 
     # Ingestion sources
+    parser.add_argument("--json", help="Ingest a JSON seed file (with context + concepts)")
     parser.add_argument("--textbook", help="Ingest a text file")
     parser.add_argument("--textbook-dir", help="Ingest all .txt files in directory")
     parser.add_argument("--wikipedia", help="Ingest Wikipedia dump")
@@ -796,7 +902,13 @@ def main():
     if args.list_sources:
         print(f"""
   ═══ AVAILABLE KNOWLEDGE SOURCES ═══
-  
+
+  📦 JSON SEED FILES (NO LLM needed! Context-aware!)
+     Pre-structured seed files with entries, concepts, and context
+     Supports default_context, per-entry context, and concept definitions
+     Usage: --json water_seed.json
+            --json ai_kb_big.json
+
   📖 TEXTBOOKS (requires LLM)
      Any .txt file → LLM decomposes into atomic facts
      Usage: --textbook file.txt
@@ -849,7 +961,11 @@ def main():
     
     # Process commands
     did_something = False
-    
+
+    if args.json:
+        ingest_json(db, args.json)
+        did_something = True
+
     if args.textbook:
         ingest_textbook(db, llm, args.textbook, args.grade)
         did_something = True
@@ -886,6 +1002,7 @@ def main():
         print("\n  No action specified. Use --help for options.")
         print("  Quick start:")
         print("    python3 ingest.py --list-sources")
+        print("    python3 ingest.py --json water_seed.json")
         print("    python3 ingest.py --textbook myfile.txt")
         print("    python3 ingest.py --add-task research 'solar system'")
     

@@ -53,6 +53,7 @@ import sqlite3
 import json
 import argparse
 from collections import defaultdict
+from domain_scope import VALID_CONTEXTS
 
 
 # ═══════════════════════════════════════════════════════════
@@ -155,7 +156,13 @@ class BridgeSystem:
             print(f"  ⚠ Unknown bridge type: {bridge_type}")
             print(f"    Valid types: {', '.join(sorted(self.VALID_TYPES))}")
             return None
-        
+
+        # Validate domain_a/domain_b against VALID_CONTEXTS (warn only, don't block)
+        if domain_a and domain_a not in VALID_CONTEXTS:
+            print(f"  ⚠ domain_a '{domain_a}' not in VALID_CONTEXTS (bridge will still be added)")
+        if domain_b and domain_b not in VALID_CONTEXTS:
+            print(f"  ⚠ domain_b '{domain_b}' not in VALID_CONTEXTS (bridge will still be added)")
+
         term_a = term_a.lower().replace(" ", "_")
         term_b = term_b.lower().replace(" ", "_")
         
